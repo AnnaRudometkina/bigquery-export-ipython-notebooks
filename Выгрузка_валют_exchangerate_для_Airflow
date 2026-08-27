@@ -1,0 +1,70 @@
+import requests as req
+import pandas as pd
+from datetime import timedelta
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils.dates import days_ago
+import json
+from clickhouse_driver import Client
+
+# Константы
+API_KEY = "043dc9dad696914726d3064e9d917294"
+START_DATE = "2024-01-01"
+END_DATE = "2024-01-01"
+TABLE_NAME = "zfhis"
+
+url = f"https://api.exchangerate.host/timeframe?access_key={API_KEY}&start_date={START_DATE}&end_date={END_DATE}"
+s_file = "exchange_rates_raw.json"
+csv_file = "exchange_rates_2024_01_01.csv"
+
+CH_CLIENT = Client(
+    host='158.160.116.58',
+    user='student',
+    password='dfqh89fhq8',
+    database='sandbox'
+)
+
+# Extract
+def extract_data(url, s_file):
+    data = req.get(url).json()
+    with open(s_file, 'w') as f:
+        json.dump(data, f)
+
+# Transform
+def transform_data(s_file, csv_file):
+    data = json.load(open(s_file))
+    rows = []
+    for date, rates in data['quotes'].items():
+        for code, value in rates.items():
+            rows.append({'date': date, 'currency_source': code[:3], 'currency': code[3:], 'value': value})
+    pd.DataFrame(rows).sort_values(['date', 'currency']).to_csv(csv_file, index=False)
+
+# Load
+def upload_to_clickhouse(csv_file, table_name, client):
+    df = pd.read_csv(csv_file)
+    client.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (date String, currency_source String, currency String, value Float64) ENGINE = Log()")
+    client.execute(f"TRUNCATE TABLE {table_name}")
+    client.execute(f"INSERT INTO {table_name} (date, currency_source, currency, value) VALUES", list(df.itertuples(index=False, name=None)))
+
+# DAG
+with DAG(
+    'fiyafsn',
+    schedule_interval='@daily',
+    start_date=days_ago(1)
+) as dag:
+    extract_task = PythonOperator(
+    task_id='extract_task', 
+    python_callable=extract_data, 
+    op_kwargs={'url': url, 's_file': s_file})
+    
+    transform_task = PythonOperator(
+    task_id='transform_task',   
+    python_callable=transform_data,
+    op_kwargs={'s_file': s_file, 'csv_file': csv_file})
+    
+    upload_task = PythonOperator(
+    task_id='upload_task', 
+    python_callable=upload_to_clickhouse, 
+    op_kwargs={'csv_file': csv_file, 'table_name': TABLE_NAME, 'client': CH_CLIENT})
+
+extract_task >> transform_task >> upload_task
