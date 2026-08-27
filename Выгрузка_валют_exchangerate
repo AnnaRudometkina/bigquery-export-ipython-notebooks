@@ -1,0 +1,136 @@
+# Установка коннектора для ClickHouse
+!pip install clickhouse-driver
+
+# Импорт необходимых библиотек
+import requests as req          # HTTP-запросы к API
+import pandas as pd             # Обработка данных
+from datetime import datetime, timedelta
+import json                     # Работа с JSON
+from clickhouse_driver import Client  # Подключение к ClickHouse
+
+# ============================================
+# Параметры API и конфигурация
+# ============================================
+API_KEY = "043dc9dad696914726d3064e9d917294"
+SOURCE_CURRENCY = "USD"                         # Базовая валюта
+START_DATE = "2023-01-01"                       # Начало периода
+END_DATE = "2023-01-01"                         # Конец периода
+
+# Формирование URL для API exchangerate.host
+url = f"https://api.exchangerate.host/timeframe?access_key={API_KEY}&source={SOURCE_CURRENCY}&start_date={START_DATE}&end_date={END_DATE}"
+
+# Имена файлов
+s_file = "exchange_rates_raw.json"              # Сырые данные из API
+csv_file = "exchange_rates_2023_01_01.csv"      # Обработанные данные
+TABLE_NAME = "exchange_rates_2023_01_01"        # Имя таблицы в ClickHouse
+
+# ============================================
+# Подключение к ClickHouse
+# ============================================
+CH_CLIENT = Client(
+    host='158.160.116.58',      # Хост БД
+    user='student',             # Пользователь
+    password='dfqh89fhq8',      # Пароль
+    database='sandbox'          # База данных
+)
+
+# ============================================
+# Шаг 1: Extract - извлечение данных из API
+# ============================================
+def extract_data(url, s_file):
+    """
+    Выполняет GET-запрос к API и сохраняет ответ в JSON-файл.
+    Возвращает данные при успехе, иначе None.
+    """
+    response = req.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        if data.get('success'):                 # Проверка успешности API-запроса
+            with open(s_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            return data
+    return None
+
+# ============================================
+# Шаг 2: Transform - преобразование данных
+# ============================================
+def transform_data(s_file, csv_file):
+    """
+    Читает JSON из файла, парсит курсы валют,
+    преобразует в плоскую таблицу и сохраняет в CSV.
+    """
+    with open(s_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    source_currency = data.get('source', 'USD')   # Базовая валюта
+    quotes = data.get('quotes', {})               # Словарь с курсами
+    
+    rows = []
+    # Перебор по датам и валютам
+    for date, rates in quotes.items():
+        for currency_code, rate_value in rates.items():
+            # Убираем префикс базовой валюты (например, USD -> RUB из USDRUB)
+            if currency_code.startswith(source_currency):
+                clean_currency = currency_code[len(source_currency):]
+                rows.append({
+                    'date': date,
+                    'currency_source': source_currency,
+                    'currency': clean_currency,
+                    'value': rate_value
+                })
+    
+    # Создание DataFrame и сортировка
+    df = pd.DataFrame(rows)
+    df = df.sort_values(['date', 'currency']).reset_index(drop=True)
+    
+    # Сохранение в CSV
+    df.to_csv(csv_file, index=False, encoding='utf-8')
+    return df
+
+# ============================================
+# Шаг 3: Load - загрузка в ClickHouse
+# ============================================
+def upload_to_clickhouse(csv_file, table_name, client):
+    """
+    Создаёт таблицу в ClickHouse (если не существует),
+    очищает её и загружает данные из CSV.
+    """
+    # Чтение CSV в DataFrame
+    df = pd.read_csv(csv_file)
+    if df.empty:
+        return False                             # Пустой файл — прерываем
+    
+    # Создание таблицы с движком Log()
+    create_query = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        date String,                             # Дата в формате YYYY-MM-DD
+        currency_source String,                  # Базовая валюта (USD)
+        currency String,                         # Код валюты (RUB, EUR и т.д.)
+        value Float64                            # Значение курса
+    ) ENGINE = Log()
+    """
+    client.execute(create_query)
+    
+    # Очистка таблицы перед загрузкой (удаление старых данных)
+    truncate_query = f"TRUNCATE TABLE {table_name}"
+    client.execute(truncate_query)
+    
+    # Подготовка данных: кортежи для вставки
+    data_to_insert = list(df.itertuples(index=False, name=None))
+    
+    # Вставка данных
+    insert_query = f"INSERT INTO {table_name} (date, currency_source, currency, value) VALUES"
+    client.execute(insert_query, data_to_insert)
+    return True
+
+# ============================================
+# Запуск ETL-пайплайна
+# ============================================
+raw_data = extract_data(url, s_file)            # Extract
+if raw_data:
+    df = transform_data(s_file, csv_file)       # Transform
+    upload_to_clickhouse(csv_file, TABLE_NAME, CH_CLIENT)  # Load
+    
+    # Проверка загруженных данных
+    result = CH_CLIENT.execute(f"SELECT * FROM {TABLE_NAME} LIMIT 5")
+    count_result = CH_CLIENT.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}")
